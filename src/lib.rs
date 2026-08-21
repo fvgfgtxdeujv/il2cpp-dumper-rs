@@ -1,0 +1,13 @@
+pub mod error;
+pub mod config;
+pub mod dump_engine;
+pub mod jni_bridge;
+pub mod mfuscator;
+pub mod io;
+pub mod il2cpp;
+pub mod formats;
+pub mod search;
+pub mod utils;
+pub mod executor;
+pub mod output;
+pub mod disassembler;

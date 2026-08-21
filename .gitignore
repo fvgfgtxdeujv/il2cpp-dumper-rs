@@ -1,0 +1,30 @@
+# Build artifacts
+target/
+**/*.so.d
+**/*.d
+**/*.rlib
+**/*.dSYM
+
+# Engine-specific build outputs
+release/
+
+# Sample input files（引擎可独立运行，测试样本勿提交）
+libil2cpp.so
+global-metadata.dat
+libil2cpp39.so
+global-metadata39.dat
+UnityFramework
+GameAssembly.dll
+
+# NDK / cargo-ndk 安装产物（如需重建 .so）
+android-ndk-r26c/
+android-ndk-*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# C# 参考实现（仅供审查，不随仓分发）
+# third_party/Cpp2IL/
+# third_party/Il2CppInspectorRedux/
+# third_party/Il2CppInspectorPlugins/
