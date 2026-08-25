@@ -66,6 +66,10 @@ struct Cli {
     no_dump_static_metadata: bool,
     #[arg(long = "force-dump")]
     force_dump: bool,
+    /// Auto-select the target architecture from a fat Mach-O instead of
+    /// prompting interactively.
+    #[arg(long = "auto-select-arch")]
+    auto_select_arch: bool,
     #[arg(num_args = 0..=3)]
     positional: Vec<String>,
 }
@@ -308,14 +312,14 @@ fn detect_unity_version(data: &[u8]) -> Option<String> {
     best
 }
 
-fn validate_hex(input: &String) -> std::result::Result<(), String> {
+fn validate_hex(input: &str, field: &str) -> std::result::Result<(), String> {
     let trimmed = input.trim().trim_start_matches("0x").trim_start_matches("0X");
     if trimmed.is_empty() {
-        return Err("Address cannot be empty".into());
+        return Err(format!("Invalid hex for {field}: '{input}'"));
     }
     u64::from_str_radix(trimmed, 16)
         .map(|_| ())
-        .map_err(|_| format!("'{}' is not a valid hex address", input))
+        .map_err(|_| format!("Invalid hex for {field}: '{input}'"))
 }
 
 fn parse_hex_input(input: &str) -> u64 {
@@ -328,7 +332,7 @@ fn prompt_dump_address() -> Option<u64> {
     println!(
         "  {} {}",
         WARN,
-        style("This appears to be a memory dump file.").yellow().bold()
+        style("Detected this may be a dump file.").yellow().bold()
     );
     println!(
         "  {}",
@@ -339,7 +343,7 @@ fn prompt_dump_address() -> Option<u64> {
     let input: String = Input::new()
         .with_prompt(format!("  {} Dump base address (hex)", SHIELD))
         .default("0".into())
-        .validate_with(validate_hex)
+        .validate_with(|input: &String| validate_hex(input, "Dump base address"))
         .interact_text()
         .unwrap_or_else(|_| "0".into());
 
@@ -356,40 +360,30 @@ fn prompt_manual_addresses() -> Result<(u64, u64)> {
     println!(
         "  {} {}",
         style("✗").red().bold(),
-        style("Auto-detection failed. Manual input required.").red()
+        style("Auto mode failed, requesting manual addresses...").red()
     );
     println!(
         "  {}",
-        style("  Provide the registration addresses in hexadecimal.").dim()
+        style("  Provide registration addresses as 'codeReg,metaReg' in hexadecimal.").dim()
     );
     println!();
 
-    let cr_input: String = Input::new()
-        .with_prompt(format!("  {} CodeRegistration (hex)", style("→").cyan()))
+    let input: String = Input::new()
+        .with_prompt(format!("  {} Registration addresses (hex, comma-separated)", style("→").cyan()))
         .validate_with(|input: &String| {
-            let trimmed = input.trim().trim_start_matches("0x").trim_start_matches("0X");
-            if trimmed.is_empty() || trimmed == "0" {
-                return Err("CodeRegistration address is required".to_string());
+            let parts: Vec<&str> = input.split(',').map(|s| s.trim()).collect();
+            if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+                return Err("Expected format: codeReg,metaReg".to_string());
             }
-            validate_hex(input)
+            validate_hex(parts[0], "CodeRegistration")?;
+            validate_hex(parts[1], "MetadataRegistration")
         })
         .interact_text()
-        .map_err(|_| rodroid_il2cppdumper::error::Error::Other("Failed to read CodeRegistration input".into()))?;
+        .map_err(|_| rodroid_il2cppdumper::error::Error::Other("Failed to read registration addresses".into()))?;
 
-    let mr_input: String = Input::new()
-        .with_prompt(format!("  {} MetadataRegistration (hex)", style("→").cyan()))
-        .validate_with(|input: &String| {
-            let trimmed = input.trim().trim_start_matches("0x").trim_start_matches("0X");
-            if trimmed.is_empty() || trimmed == "0" {
-                return Err("MetadataRegistration address is required".to_string());
-            }
-            validate_hex(input)
-        })
-        .interact_text()
-        .map_err(|_| rodroid_il2cppdumper::error::Error::Other("Failed to read MetadataRegistration input".into()))?;
-
-    let cr = parse_hex_input(&cr_input);
-    let mr = parse_hex_input(&mr_input);
+    let mut parts = input.split(',');
+    let cr = parse_hex_input(parts.next().unwrap_or("").trim());
+    let mr = parse_hex_input(parts.next().unwrap_or("").trim());
     println!();
     print_address("CodeRegistration", cr);
     print_address("MetadataRegistration", mr);
@@ -608,24 +602,45 @@ fn init_macho_fat(data: Vec<u8>, metadata: &Metadata, config: &Config) -> Result
     print_detection(&format!("Fat Mach-O with {} architectures", arches.len()));
     println!();
 
-    let items: Vec<String> = arches
-        .iter()
-        .enumerate()
-        .map(|(i, arch)| {
-            if arch.magic == MH_MAGIC_64 {
-                format!("{}. 64-bit", i + 1)
-            } else {
-                format!("{}. 32-bit", i + 1)
-            }
-        })
-        .collect();
+    let selection = if config.auto_select_arch {
+        // Mirrors the reference so's auto architecture selection
+        // (fcn.003e7d6c): prefer the first 64-bit slice, fall back to the
+        // first architecture otherwise, and report what was picked.
+        let idx = arches
+            .iter()
+            .position(|arch| arch.magic == MH_MAGIC_64)
+            .unwrap_or(0);
+        let bits = if arches[idx].magic == MH_MAGIC_64 {
+            "64-bit"
+        } else {
+            "32-bit"
+        };
+        println!(
+            "  {} {}",
+            style("Auto-selected architecture:").cyan().bold(),
+            style(bits).white().bold()
+        );
+        idx
+    } else {
+        let items: Vec<String> = arches
+            .iter()
+            .enumerate()
+            .map(|(i, arch)| {
+                if arch.magic == MH_MAGIC_64 {
+                    format!("{}. 64-bit", i + 1)
+                } else {
+                    format!("{}. 32-bit", i + 1)
+                }
+            })
+            .collect();
 
-    let selection = Select::new()
-        .with_prompt(format!("  {} Select target architecture", GEAR))
-        .items(&items)
-        .default(0)
-        .interact()
-        .unwrap_or(0);
+        Select::new()
+            .with_prompt(format!("  {} Select target architecture", GEAR))
+            .items(&items)
+            .default(0)
+            .interact()
+            .unwrap_or(0)
+    };
 
     let slice = extract_fat_slice(&data, &arches[selection])?;
     init_macho(slice, metadata, config)
@@ -923,6 +938,7 @@ fn run() -> Result<()> {
     if cli.dump_static_metadata { config.dump_static_field_metadata = true; }
     if cli.no_dump_static_metadata { config.dump_static_field_metadata = false; }
     if cli.force_dump { config.force_dump = true; }
+    if cli.auto_select_arch { config.auto_select_arch = true; }
 
     let base_dir = std::path::Path::new(&output_dir_arg);
     let mut dump_num = 0u32;

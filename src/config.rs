@@ -47,6 +47,9 @@ pub struct Config {
     /// Include hex/metadata for FieldRVA (`PrivateImplementationDetails`) entries.
     pub dump_field_rva_data: bool,
     pub max_field_rva_dump_bytes: usize,
+    /// Auto-select the target architecture from a fat Mach-O instead of
+    /// prompting interactively (mirrors the reference native engine).
+    pub auto_select_arch: bool,
 }
 
 impl Default for Config {
@@ -94,6 +97,7 @@ impl Default for Config {
             dump_static_field_metadata: false,
             dump_field_rva_data: false,
             max_field_rva_dump_bytes: 4096,
+            auto_select_arch: false,
         }
     }
 }

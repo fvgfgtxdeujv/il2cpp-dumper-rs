@@ -318,14 +318,14 @@ pub fn try_decrypt_metadata(data: &mut Vec<u8>) -> Option<String> {
 // Input helpers (sink-backed replacements for dialoguer prompts)
 // ---------------------------------------------------------------------------
 
-fn validate_hex(input: &str) -> std::result::Result<(), String> {
+fn validate_hex(input: &str, field: &str) -> std::result::Result<(), String> {
     let trimmed = input.trim().trim_start_matches("0x").trim_start_matches("0X");
     if trimmed.is_empty() {
-        return Err("Address cannot be empty".into());
+        return Err(format!("Invalid hex for {field}: '{input}'"));
     }
     u64::from_str_radix(trimmed, 16)
         .map(|_| ())
-        .map_err(|_| format!("'{input}' is not a valid hex address"))
+        .map_err(|_| format!("Invalid hex for {field}: '{input}'"))
 }
 
 fn parse_hex_input(input: &str) -> u64 {
@@ -335,7 +335,7 @@ fn parse_hex_input(input: &str) -> u64 {
 
 /// Ask for a memory-dump base address; `None` means "skip" (address 0).
 fn request_dump_address(sink: &mut dyn DumpSink) -> Option<u64> {
-    sink.warn("This appears to be a memory dump file.");
+    sink.warn("Detected this may be a dump file.");
     let input = sink.request_input("Dump base address (hex), or 0 to skip", Some("0"))?;
     let addr = parse_hex_input(&input);
     if addr != 0 {
@@ -346,22 +346,22 @@ fn request_dump_address(sink: &mut dyn DumpSink) -> Option<u64> {
 }
 
 /// Ask for CodeRegistration / MetadataRegistration addresses.
+///
+/// Mirrors the reference native engine: a single request tagged
+/// `manual_addresses` whose reply is `"codeReg,metaReg"` (comma-separated
+/// hex values). Each field is validated independently.
 fn request_manual_addresses(sink: &mut dyn DumpSink) -> Result<(u64, u64)> {
-    sink.warn("Auto-detection failed. Manual input required.");
-    let cr_input = sink
-        .request_input("CodeRegistration (hex)", None)
-        .ok_or_else(|| Error::Other("CodeRegistration input unavailable (no interactive channel)".into()))?;
-    let mr_input = sink
-        .request_input("MetadataRegistration (hex)", None)
-        .ok_or_else(|| Error::Other("MetadataRegistration input unavailable (no interactive channel)".into()))?;
-    if let Err(e) = validate_hex(&cr_input) {
-        return Err(Error::Other(format!("Invalid CodeRegistration: {e}")));
-    }
-    if let Err(e) = validate_hex(&mr_input) {
-        return Err(Error::Other(format!("Invalid MetadataRegistration: {e}")));
-    }
-    let cr = parse_hex_input(&cr_input);
-    let mr = parse_hex_input(&mr_input);
+    sink.warn("Auto mode failed, requesting manual addresses...");
+    let input = sink
+        .request_input("manual_addresses", None)
+        .ok_or_else(|| Error::Other("Manual mode cancelled".into()))?;
+    let mut parts = input.split(',');
+    let cr_input = parts.next().unwrap_or("").trim();
+    let mr_input = parts.next().unwrap_or("").trim();
+    validate_hex(cr_input, "CodeRegistration").map_err(Error::Other)?;
+    validate_hex(mr_input, "MetadataRegistration").map_err(Error::Other)?;
+    let cr = parse_hex_input(cr_input);
+    let mr = parse_hex_input(mr_input);
     sink.log(&format!("CodeRegistration: 0x{cr:x}"));
     sink.log(&format!("MetadataRegistration: 0x{mr:x}"));
     Ok((cr, mr))
@@ -617,24 +617,19 @@ fn init_macho_fat(
         arches.len()
     ));
 
-    // Prefer an explicit selection via the sink; fall back to the first
-    // 64-bit slice (or the first slice) when no interactive channel exists.
-    let selection: usize = sink
-        .request_input(
-            &format!(
-                "Select target architecture (1..={})",
-                arches.len()
-            ),
-            Some("1"),
-        )
-        .and_then(|input| input.trim().parse::<usize>().ok())
-        .and_then(|n| (n >= 1 && n <= arches.len()).then_some(n - 1))
-        .unwrap_or_else(|| {
-            arches
-                .iter()
-                .position(|arch| arch.magic == MH_MAGIC_64)
-                .unwrap_or(0)
-        });
+    // Mirrors the reference so's auto architecture selection
+    // (fcn.003e7d6c): prefer the first 64-bit slice, fall back to the
+    // first architecture otherwise, and report what was picked.
+    let selection = arches
+        .iter()
+        .position(|arch| arch.magic == MH_MAGIC_64)
+        .unwrap_or(0);
+    let bits = if arches[selection].magic == MH_MAGIC_64 {
+        "64-bit"
+    } else {
+        "32-bit"
+    };
+    sink.log(&format!("Auto-selected architecture: {bits}"));
 
     let slice = extract_fat_slice(&data, &arches[selection])?;
     init_macho(slice, metadata, config, sink)
@@ -1113,4 +1108,91 @@ pub fn dump_with_sink(
         unity_version: unity_version_str,
         format: format.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sink that returns a canned reply for `request_input` and records
+    /// every prompt/log/warn line it receives.
+    struct StubSink {
+        reply: Option<String>,
+        prompts: Vec<String>,
+        warns: Vec<String>,
+        logs: Vec<String>,
+    }
+
+    impl DumpSink for StubSink {
+        fn request_input(&mut self, prompt: &str, _default: Option<&str>) -> Option<String> {
+            self.prompts.push(prompt.to_string());
+            self.reply.clone()
+        }
+        fn warn(&mut self, msg: &str) {
+            self.warns.push(msg.to_string());
+        }
+        fn log(&mut self, msg: &str) {
+            self.logs.push(msg.to_string());
+        }
+    }
+
+    fn stub(reply: Option<&str>) -> StubSink {
+        StubSink {
+            reply: reply.map(String::from),
+            prompts: vec![],
+            warns: vec![],
+            logs: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_hex_reports_field_specific_errors() {
+        assert_eq!(
+            validate_hex("zz", "CodeRegistration"),
+            Err("Invalid hex for CodeRegistration: 'zz'".to_string())
+        );
+        assert_eq!(
+            validate_hex("", "MetadataRegistration"),
+            Err("Invalid hex for MetadataRegistration: ''".to_string())
+        );
+        assert!(validate_hex("0xABCDEF", "CodeRegistration").is_ok());
+    }
+
+    #[test]
+    fn manual_addresses_parses_comma_separated_single_request() {
+        let mut sink = stub(Some("ABCDEF,123456"));
+        let (cr, mr) = request_manual_addresses(&mut sink).unwrap();
+        assert_eq!(cr, 0xABCDEF);
+        assert_eq!(mr, 0x123456);
+        assert_eq!(sink.prompts, vec!["manual_addresses".to_string()]);
+        assert_eq!(
+            sink.warns,
+            vec!["Auto mode failed, requesting manual addresses...".to_string()]
+        );
+    }
+
+    #[test]
+    fn manual_addresses_tolerates_spaces_and_prefix() {
+        let mut sink = stub(Some("0xABC, 0x123"));
+        let (cr, mr) = request_manual_addresses(&mut sink).unwrap();
+        assert_eq!(cr, 0xABC);
+        assert_eq!(mr, 0x123);
+    }
+
+    #[test]
+    fn manual_addresses_rejects_bad_field() {
+        let mut sink = stub(Some("ABC,zzz"));
+        let err = request_manual_addresses(&mut sink).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid hex for MetadataRegistration: 'zzz'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn manual_addresses_cancelled_without_channel() {
+        let mut sink = stub(None);
+        let err = request_manual_addresses(&mut sink).unwrap_err();
+        assert_eq!(err.to_string(), "Manual mode cancelled");
+    }
 }
